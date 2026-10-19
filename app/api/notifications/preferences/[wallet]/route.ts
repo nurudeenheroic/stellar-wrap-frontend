@@ -1,12 +1,32 @@
 /**
  * GET  /api/notifications/preferences/:wallet  — read subscription record
  * PUT  /api/notifications/preferences/:wallet  — update subscription record
+ *
+ * Both methods require proof of address control: the caller must present a
+ * signed challenge (see `_lib/auth`) proving they own the wallet. The email
+ * address in the record is personal data and is never returned to an
+ * unauthenticated caller.
  */
 
 import { NextRequest, NextResponse } from "next/server";
+// KV_FAILURE: GET → DEGRADE (missing record returns 404; transient KV errors
+//             surface as 500 via internalApiError — acceptable for a read).
+//             PUT → LOUD (a failed write means the change was not saved).
 import { kvGet, kvSet, SUB_KEY } from "../../_lib/kv";
 import { logger } from "@/app/utils/logger";
 import type { SubscriptionRecord } from "@/app/types/notifications";
+import { apiError, internalApiError } from "@/app/api/_lib/apiError";
+import { verifyWalletChallenge } from "../../_lib/auth";
+import {
+  getClientIp,
+  checkRateLimit,
+  rateLimitDenialResponse,
+  PREFERENCES_IP_LIMIT,
+  PREFERENCES_IP_WINDOW,
+  PREFERENCES_WALLET_LIMIT,
+  PREFERENCES_WALLET_WINDOW,
+} from "../../_lib/rateLimit";
+import { isValidWalletAddress as isValidWallet } from "@/src/utils/validateStellarAddress";
 
 const log = logger.child("api:preferences");
 
@@ -14,28 +34,37 @@ interface RouteParams {
   params: Promise<{ wallet: string }>;
 }
 
-function isValidWallet(address: string): boolean {
-  return typeof address === "string" && address.startsWith("G") && address.length === 56;
+/**
+ * Strip personal data (email) from a record before returning it to a caller
+ * that has not proven control of the wallet.
+ */
+function redactRecord(record: SubscriptionRecord): SubscriptionRecord {
+  return { ...record, email: undefined };
 }
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
     const { wallet } = await params;
 
     if (!isValidWallet(wallet)) {
-      return NextResponse.json({ error: "Invalid wallet address" }, { status: 400 });
+      return apiError("INVALID_WALLET", "Invalid wallet address", 400);
     }
 
     const record = await kvGet<SubscriptionRecord>(SUB_KEY(wallet));
 
     if (!record) {
-      return NextResponse.json({ error: "No subscription found" }, { status: 404 });
+      return apiError("NOT_FOUND", "No subscription found", 404);
+    }
+
+    const authenticated = await verifyWalletChallenge(request, wallet);
+
+    if (!authenticated) {
+      return NextResponse.json(redactRecord(record), { status: 200 });
     }
 
     return NextResponse.json(record, { status: 200 });
   } catch (err) {
-    log.error("Error reading notification preferences:", err);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return internalApiError(log, err);
   }
 }
 
@@ -44,15 +73,52 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     const { wallet } = await params;
 
     if (!isValidWallet(wallet)) {
-      return NextResponse.json({ error: "Invalid wallet address" }, { status: 400 });
+      return apiError("INVALID_WALLET", "Invalid wallet address", 400);
     }
 
-    const body = await request.json() as Partial<SubscriptionRecord>;
+    // Rate-limit by source IP
+    const ipDenial = rateLimitDenialResponse(
+      await checkRateLimit(
+        `ratelimit:ip:preferences:${getClientIp(request)}`,
+        PREFERENCES_IP_LIMIT,
+        PREFERENCES_IP_WINDOW
+      )
+    );
+
+    if (ipDenial) {
+      return ipDenial;
+    }
+
+    // Rate-limit by target wallet
+    const walletDenial = rateLimitDenialResponse(
+      await checkRateLimit(
+        `ratelimit:wallet:preferences:${wallet}`,
+        PREFERENCES_WALLET_LIMIT,
+        PREFERENCES_WALLET_WINDOW
+      )
+    );
+
+    if (walletDenial) {
+      return walletDenial;
+    }
+
+    // Authenticate wallet ownership
+    const authenticated = await verifyWalletChallenge(request, wallet);
+
+    if (!authenticated) {
+      return apiError(
+        "UNAUTHORIZED",
+        "Proof of wallet ownership required",
+        401,
+      );
+    }
+
+    const body = (await request.json()) as Partial<SubscriptionRecord>;
 
     const existing = await kvGet<SubscriptionRecord>(SUB_KEY(wallet));
 
     if (!existing) {
-      return NextResponse.json({ error: "No subscription found" }, { status: 404 });
+      return apiError("NOT_FOUND", "No subscription found", 404);
     }
 
     // Merge only allowed fields — never overwrite walletAddress
@@ -67,7 +133,6 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(updated, { status: 200 });
   } catch (err) {
-    log.error("Error updating notification preferences:", err);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return internalApiError(log, err);
   }
 }
