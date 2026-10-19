@@ -6,7 +6,9 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { kvGet, kvSet, SUB_KEY } from "../_lib/kv";
+// KV_FAILURE: LOUD — a failed write means the pending subscription was not
+// saved and no confirmation email will be sent; error propagates.
+import { kvGet, kvSet, SUB_KEY, PERIOD_KEY, kvSAdd, kvSRem } from "../_lib/kv";
 import { sendEmail } from "../_lib/email";
 import { logger } from "@/app/utils/logger";
 
@@ -14,7 +16,7 @@ const log = logger.child("api:subscribe-email");
 import {
   getClientIp,
   checkRateLimit,
-  rateLimitResponse,
+  rateLimitDenialResponse,
   SUBSCRIBE_EMAIL_IP_LIMIT,
   SUBSCRIBE_EMAIL_IP_WINDOW,
   SUBSCRIBE_EMAIL_TARGET_LIMIT,
@@ -23,22 +25,47 @@ import {
 import { isValidEmail } from "@/app/utils/notifications/emailValidator";
 import { generateUnsubscribeToken } from "@/app/utils/notifications/unsubscribeToken";
 import type { SubscriptionRecord, PeriodPrefs } from "@/app/types/notifications";
+import { apiError, internalApiError } from "@/app/api/_lib/apiError";
 
-function isValidWallet(address: string): boolean {
-  return typeof address === "string" && address.startsWith("G") && address.length === 56;
+const VALID_PERIODS = ["weekly", "monthly", "yearly"] as const;
+
+async function syncPeriodIndex(
+  walletAddress: string,
+  previousPeriods: PeriodPrefs | undefined,
+  currentPeriods: PeriodPrefs
+) {
+  const ops = VALID_PERIODS.map((period) => {
+    const key = PERIOD_KEY(period);
+    const enabled = !!currentPeriods[period];
+    const wasEnabled = !!previousPeriods?.[period];
+
+    if (enabled) {
+      return kvSAdd(key, walletAddress);
+    }
+    if (wasEnabled) {
+      return kvSRem(key, walletAddress);
+    }
+    return Promise.resolve();
+  });
+
+  await Promise.all(ops);
 }
+
+import { isValidWalletAddress as isValidWallet } from "@/src/utils/validateStellarAddress";
 
 export async function POST(request: NextRequest) {
   try {
     const ip = getClientIp(request);
-    const ipLimitResult = await checkRateLimit(
-      `ratelimit:ip:subscribe-email:${ip}`,
-      SUBSCRIBE_EMAIL_IP_LIMIT,
-      SUBSCRIBE_EMAIL_IP_WINDOW,
+    const ipDenial = rateLimitDenialResponse(
+      await checkRateLimit(
+        `ratelimit:ip:subscribe-email:${ip}`,
+        SUBSCRIBE_EMAIL_IP_LIMIT,
+        SUBSCRIBE_EMAIL_IP_WINDOW
+      )
     );
 
-    if (!ipLimitResult.allowed) {
-      return rateLimitResponse(ipLimitResult.resetInSeconds);
+    if (ipDenial) {
+      return ipDenial;
     }
 
     const body = await request.json();
@@ -49,26 +76,28 @@ export async function POST(request: NextRequest) {
     };
 
     if (!isValidWallet(walletAddress)) {
-      return NextResponse.json({ error: "Invalid wallet address" }, { status: 400 });
+      return apiError("INVALID_WALLET", "Invalid wallet address", 400);
     }
 
     if (!isValidEmail(email)) {
-      return NextResponse.json({ error: "Invalid email address" }, { status: 400 });
+      return apiError("INVALID_EMAIL", "Invalid email address", 400);
     }
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const emailLimitResult = await checkRateLimit(
-      `ratelimit:email:subscribe-email:${normalizedEmail}`,
-      SUBSCRIBE_EMAIL_TARGET_LIMIT,
-      SUBSCRIBE_EMAIL_TARGET_WINDOW,
+    // Keyed on the target address, so the same mailbox cannot be mailed over
+    // and over from a rotating set of source IPs.
+    const emailDenial = rateLimitDenialResponse(
+      await checkRateLimit(
+        `ratelimit:email:subscribe-email:${normalizedEmail}`,
+        SUBSCRIBE_EMAIL_TARGET_LIMIT,
+        SUBSCRIBE_EMAIL_TARGET_WINDOW
+      ),
+      "Too many requests for this email address. Please try again later."
     );
 
-    if (!emailLimitResult.allowed) {
-      return rateLimitResponse(
-        emailLimitResult.resetInSeconds,
-        "Too many requests for this email address. Please try again later.",
-      );
+    if (emailDenial) {
+      return emailDenial;
     }
 
     const existing = (await kvGet<SubscriptionRecord>(SUB_KEY(walletAddress))) ?? {
@@ -80,15 +109,33 @@ export async function POST(request: NextRequest) {
     const isSameEmail = existing.email?.address?.trim().toLowerCase() === normalizedEmail;
     const isAlreadyActive = isSameEmail && existing.email?.status === "active";
 
-    const confirmationToken = isSameEmail && existing.email?.confirmationToken
-      ? existing.email.confirmationToken
-      : generateUnsubscribeToken();
+    // Re-use the existing token (and its issuedAt) only when it is the same e-mail
+    // and the token was issued recently enough that a fresh one is not needed.
+    const confirmationToken =
+      isSameEmail && existing.email?.confirmationToken
+        ? existing.email.confirmationToken
+        : generateUnsubscribeToken();
 
-    const unsubscribeToken = isSameEmail && existing.email?.unsubscribeToken
-      ? existing.email.unsubscribeToken
-      : generateUnsubscribeToken();
+    // Track when this token was issued so confirm-email can enforce the 24 h window.
+    const tokenIssuedAt =
+      isSameEmail && existing.email?.tokenIssuedAt && existing.email?.confirmationToken === confirmationToken
+        ? existing.email.tokenIssuedAt
+        : new Date().toISOString();
+
+    const unsubscribeToken =
+      isSameEmail && existing.email?.unsubscribeToken
+        ? existing.email.unsubscribeToken
+        : generateUnsubscribeToken();
 
     const status = isAlreadyActive ? "active" : "pending";
+
+    const normalizedPeriods: PeriodPrefs = periods ?? {
+      weekly: false,
+      monthly: false,
+      yearly: false,
+    };
+
+    const previousPeriods = existing.email?.periods;
 
     const updated: SubscriptionRecord = {
       ...existing,
@@ -96,15 +143,20 @@ export async function POST(request: NextRequest) {
         address: normalizedEmail,
         status,
         confirmationToken,
+        tokenIssuedAt,
         unsubscribeToken,
-        periods: periods ?? { weekly: false, monthly: false, yearly: false },
-        createdAt: isSameEmail && existing.email?.createdAt
-          ? existing.email.createdAt
-          : new Date().toISOString(),
+        periods: normalizedPeriods,
+        createdAt:
+          isSameEmail && existing.email?.createdAt
+            ? existing.email.createdAt
+            : new Date().toISOString(),
       },
     };
 
     await kvSet(SUB_KEY(walletAddress), updated);
+
+    // Update period index
+    await syncPeriodIndex(walletAddress, previousPeriods, normalizedPeriods);
 
     if (!isAlreadyActive) {
       const baseUrl = process.env.APP_BASE_URL ?? "http://localhost:3000";
@@ -123,7 +175,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ ok: true, status }, { status: 200 });
   } catch (err) {
-    log.error("Internal error creating email subscription:", err);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return internalApiError(log, err);
   }
 }
