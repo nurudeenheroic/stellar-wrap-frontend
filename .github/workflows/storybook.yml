@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: ["**"]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
 
 # Allow the deploy job to publish to GitHub Pages.
 permissions:
@@ -25,22 +28,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.25.0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Setup
+        uses: ./.github/actions/setup
 
       - name: Build Storybook
         run: pnpm run build-storybook
+
+      # Accessibility assertions run against the built Storybook so violations
+      # fail CI instead of only surfacing in the Storybook UI.
+      #
+      # Division of responsibility:
+      #   - @storybook/addon-a11y: interactive, per-story feedback in the
+      #     Storybook UI for authors while developing components.
+      #   - @axe-core/playwright: automated, headless assertions in CI against
+      #     the built Storybook (component-level checks). Page-level axe checks
+      #     live in the Playwright e2e suite (see e2e-tests.yml).
+      #
+      # The check gates on regression against a recorded baseline
+      # (a11y-baseline.json) so pre-existing violations tracked by #421, #426,
+      # and #500 do not block the work; new violations fail the build.
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run accessibility assertions
+        run: pnpm run test:a11y
+
+      - name: Upload accessibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11y-report
+          path: a11y-report/
+          if-no-files-found: ignore
 
       - name: Upload Pages artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
