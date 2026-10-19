@@ -69,6 +69,10 @@ pnpm test:coverage  # Jest coverage
 # Visual tests
 pnpm test:visual
 pnpm test:visual:update  # Update snapshots
+
+# E2E tests (Playwright)
+pnpm test:e2e
+pnpm test:e2e:ui
 ```
 
 ## Configuration Files
@@ -81,15 +85,25 @@ pnpm test:visual:update  # Update snapshots
 
 ## CI Pipeline
 
-The CI runs tests in this order:
+Each check runs in exactly one workflow:
 
-1. **Lint** - Code quality checks
-2. **Jest unit tests** - Fast unit tests with mocks
-3. **Vitest integration tests** - Comprehensive integration tests
-4. **Build** - Ensure code compiles
-5. **Playwright visual tests** - Visual regression (separate workflow)
+| Workflow | Responsibility |
+|----------|----------------|
+| `code-quality.yml` | ESLint, Prettier and TypeScript (the authoritative lint check) |
+| `ci.yml` | Lock file validation, unit tests with coverage, production build, visual regression |
+| `storybook.yml` | Storybook build (and GitHub Pages deploy on `main`) |
+| `e2e-tests.yml` | Playwright end-to-end tests |
+| `lighthouse.yml` | Lighthouse audits |
+| `bundle-size.yml` | Bundle analyzer report |
+| `dependency-audit.yml` | `pnpm audit` when dependencies change |
+| `openapi-lint.yml` | OpenAPI spec lint and route coverage |
 
-All test suites must pass for PR approval.
+pnpm, Node.js, the dependency cache and the install are shared through the
+`.github/actions/setup` composite action. Pull requests that only change
+Markdown or `docs/` skip the code quality, test, build, Storybook, E2E,
+Lighthouse and bundle size workflows.
+
+All checks must pass for PR approval.
 
 ## Coverage
 
@@ -97,6 +111,22 @@ Jest generates coverage reports for unit tests:
 - **Target**: 80%+ for all metrics
 - **Report**: `coverage/lcov-report/index.html`
 - **Command**: `pnpm test:coverage`
+
+## E2E Tests
+
+End-to-end tests live under `e2e/` and run with Playwright (`*.spec.ts`). They exercise complete user journeys against the running app, mocking network requests and global state so runs are deterministic in CI.
+
+### Smart Contract Invocation Flow
+
+The Smart Contract Invocation journey is covered end-to-end in `e2e/smart-contract-invocation.spec.ts`. The suite walks a user from opening the invocation page through connecting a wallet, entering contract details, submitting the invocation, and confirming the result. It also covers the unhappy paths and edge cases required by the acceptance criteria:
+
+- **Happy path**: connect wallet → fill contract address, method, and arguments → submit → success confirmation with the returned transaction hash.
+- **Validation errors**: missing/invalid contract address, empty method name, and malformed JSON arguments surface inline errors and block submission.
+- **Wallet errors**: rejected connection and rejected signature requests show a recoverable error state without losing entered form data.
+- **Network errors**: RPC/indexer failures are mocked to return errors and the UI shows a retry affordance that succeeds on the next attempt.
+- **Edge cases**: empty argument list, very large argument payloads, and duplicate submissions (button disabled while pending) are asserted.
+
+Network requests are intercepted with `page.route(...)` and global wallet state is stubbed via `page.addInitScript(...)`, so no real chain or wallet is required. Tests use role/text-based locators and explicit `expect(...).toBeVisible()` waits (no arbitrary timeouts) to stay reliable and flake-free in CI.
 
 ## Examples
 
@@ -146,6 +176,64 @@ describe('MyService Comprehensive Tests', () => {
 });
 ```
 
+### Playwright E2E Test Example
+
+```typescript
+// e2e/transaction-signing.spec.ts
+import { test, expect } from '@playwright/test';
+
+test.describe('Transaction Signing flow', () => {
+  test('signs a transaction end to end', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Connect Wallet' }).click();
+    await page.getByRole('button', { name: 'Sign Transaction' }).click();
+    await expect(page.getByText('Transaction signed')).toBeVisible();
+  });
+});
+```
+
+```typescript
+// e2e/smart-contract-invocation.spec.ts
+import { test, expect } from '@playwright/test';
+
+test('invokes a smart contract successfully', async ({ page }) => {
+  await page.route('**/api/rpc', (route) =>
+    route.fulfill({ status: 200, body: JSON.stringify({ txHash: '0xabc' }) }),
+  );
+
+  await page.goto('/en/invoke');
+  await page.getByRole('button', { name: /connect wallet/i }).click();
+  await page.getByLabel(/contract address/i).fill('0x0000000000000000000000000000000000000000');
+  await page.getByLabel(/method/i).fill('transfer');
+  await page.getByRole('button', { name: /invoke/i }).click();
+
+  await expect(page.getByText(/0xabc/)).toBeVisible();
+});
+```
+
+## Transaction Signing E2E Tests
+
+The `Transaction Signing` user journey is critical and covered by Playwright E2E tests in `e2e/transaction-signing.spec.ts`. These tests simulate a user going through the flow from start to finish and must satisfy the following acceptance criteria:
+
+- **Wallet interaction**: Connect and interact gracefully with the target Web3 wallet (e.g., Freighter). Wallet APIs are stubbed via `page.addInitScript` so the flow is deterministic and does not depend on a real extension.
+- **Stellar amount formatting**: Verify correct parsing and formatting of Stellar amounts, including 7 decimal precision and Stroops conversion (e.g., `1.0000000` XLM ↔ `10000000` Stroops).
+- **Network latency & timeouts**: Simulate slow RPC responses and connection timeouts to confirm the UI degrades gracefully without crashing.
+- **Rejected signature**: Assert a clear error message is displayed when the user rejects the transaction signature.
+- **RPC optimization**: Assert that RPC calls are deduplicated/cached so repeated renders do not trigger redundant requests that could cause rate-limiting.
+
+### Running the Transaction Signing E2E Tests
+
+```bash
+# Run the full E2E suite
+pnpm test:e2e
+
+# Run only the Transaction Signing flow
+pnpm test:e2e -- e2e/transaction-signing.spec.ts
+
+# Debug interactively
+pnpm test:e2e:ui
+```
+
 ## Migration Guide
 
 ### Moving a Test from Jest to Vitest
@@ -178,6 +266,7 @@ describe('MyService Comprehensive Tests', () => {
 Check the file naming:
 - Jest: Must end with `.test.ts` or `.test.tsx`
 - Vitest: Must end with `.comprehensive.test.ts`, `.edge.test.ts`, or `.integration.test.ts`
+- Playwright: Must end with `.spec.ts`
 
 ### Import errors?
 

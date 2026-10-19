@@ -18,6 +18,7 @@ import { MuteToggle } from "../../components/MuteToggle";
 import { ConnectWalletButton } from "../../components/ConnectWalletButton";
 import {
   connectFreighter,
+  getFreighterNetwork,
   connectAlbedo,
   connectXBull,
   isXBullInstalled,
@@ -33,13 +34,20 @@ import {
   clearDemoMode,
 } from "@/app/data/demoAccount";
 
+const log = logger.child("connect");
+
 export default function ConnectPage() {
   const router = useRouter();
   const t = useTranslations("ConnectPage");
   const { setAddress, setError, setStatus, network, reset } = useWrapStore();
   const { resetTransaction } = useTransactionStore();
   const { reset: resetMultiTimeframe } = useMultiTimeframeStore();
-  const { connect: connectWalletSession } = useWalletStore();
+  const {
+    connect: connectWalletSession,
+    address: connectedAddress,
+    provider: connectedProvider,
+    isConnected,
+  } = useWalletStore();
   const { playSound } = useSound();
   const isOnline = useOnlineStatus();
 
@@ -79,6 +87,7 @@ export default function ConnectPage() {
   const backButtonRef = useRef<HTMLButtonElement>(null);
   const addressInputRef = useRef<HTMLInputElement>(null);
   const connectButtonRef = useRef<HTMLButtonElement>(null);
+  const freighterButtonRef = useRef<HTMLButtonElement>(null);
   const demoButtonRef = useRef<HTMLButtonElement>(null);
 
   // Load last-used address from localStorage on mount
@@ -95,6 +104,34 @@ export default function ConnectPage() {
       mainContentRef.current.focus();
     }
   }, []);
+
+  // Freighter does not provide a reliable cross-browser network-change event.
+  // Poll its read-only network details while connected so a switch in the
+  // extension is surfaced persistently and cannot be bypassed at Continue.
+  useEffect(() => {
+    if (!isConnected || connectedProvider !== "freighter" || !connectedAddress) {
+      return;
+    }
+
+    let active = true;
+    const checkNetwork = async () => {
+      const actual = await getFreighterNetwork();
+      if (!active || actual === null) return;
+
+      if (actual !== network) {
+        setNetworkMismatch({ expected: network, actual });
+      } else {
+        setNetworkMismatch(null);
+      }
+    };
+
+    void checkNetwork();
+    const interval = window.setInterval(checkNetwork, 3_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [connectedAddress, connectedProvider, isConnected, network]);
 
   /**
    * Persist the most recently used wallet address to localStorage so it can
@@ -306,7 +343,7 @@ export default function ConnectPage() {
     }
   };
 
-  const handleManualSubmit = (e?: FormEvent) => {
+  const handleManualSubmit = (e?: FormEvent<HTMLFormElement>) => {
     if (e) e.preventDefault();
 
     if (!isOnline) {
@@ -347,6 +384,7 @@ export default function ConnectPage() {
   };
 
   const handleContinue = () => {
+    if (networkMismatch) return;
     router.push("/loading");
   };
 
@@ -485,7 +523,7 @@ export default function ConnectPage() {
     // which is required for full-page accessibility compliance.
   };
 
-  const errorId = localError ? "address-error" : undefined;
+  const errorId = errorMessage || localError ? "address-error" : undefined;
 
   return (
     <main
@@ -497,11 +535,11 @@ export default function ConnectPage() {
       {/* Progress Indicator */}
       <ProgressIndicator currentStep={2} totalSteps={6} showNext={false} />
 
-      {/* Background elements */}
-      <div className="absolute inset-0 bg-linear-to-br from-black via-black to-black opacity-60" />
+      {/* Background elements (decorative — hidden from assistive tech) */}
+      <div aria-hidden="true" className="absolute inset-0 bg-linear-to-br from-black via-black to-black opacity-60" />
 
-      {/* Animated grid background */}
-      <div className="absolute inset-0 opacity-20">
+      {/* Animated grid background (decorative — hidden from assistive tech) */}
+      <div aria-hidden="true" className="absolute inset-0 opacity-20">
         <motion.div
           className="w-full h-full"
           style={{
@@ -520,8 +558,9 @@ export default function ConnectPage() {
         />
       </div>
 
-      {/* Glowing orbs */}
+      {/* Glowing orbs (decorative — hidden from assistive tech) */}
       <motion.div
+        aria-hidden="true"
         className="absolute w-96 h-96 rounded-full blur-[120px]"
         style={{ backgroundColor: "rgba(var(--color-theme-primary-rgb), 0.3)" }}
         animate={{
@@ -678,6 +717,7 @@ export default function ConnectPage() {
               </span>
             </motion.button>
             <button
+              type="button"
               onClick={clearSavedAddress}
               className="w-full mt-2 text-xs sm:text-sm text-white/50 hover:text-white/70 transition-colors font-medium"
               tabIndex={0}
@@ -744,7 +784,6 @@ export default function ConnectPage() {
                 aria-required="true"
                 aria-invalid={!!localError}
                 aria-describedby={errorId}
-                aria-errormessage={errorId}
                 autoComplete="off"
               />
 
@@ -774,7 +813,11 @@ export default function ConnectPage() {
                     exit={{ opacity: 0, scale: 0.8 }}
                     className="absolute right-12 top-1/2 -translate-y-1/2 pr-2 border-r border-white/20"
                   >
-                    <div className="w-5 h-5 border-2 border-theme-primary border-t-transparent rounded-full animate-spin" />
+                    <div
+                      role="status"
+                      aria-label="Validating address"
+                      className="w-5 h-5 border-2 border-theme-primary border-t-transparent rounded-full animate-spin"
+                    />
                   </motion.div>
                 ) : validationState === "valid" ? (
                   <motion.div
@@ -788,6 +831,7 @@ export default function ConnectPage() {
                       className="w-5 h-5 text-green-500"
                       aria-hidden="true"
                     />
+                    <span className="sr-only">Address valid</span>
                   </motion.div>
                 ) : validationState === "invalid" ||
                   validationState === "invalid-format" ||
@@ -805,6 +849,7 @@ export default function ConnectPage() {
                       className="w-5 h-5 text-red-500"
                       aria-hidden="true"
                     />
+                    <span className="sr-only">Address invalid</span>
                   </motion.div>
                 ) : null}
               </AnimatePresence>
@@ -814,6 +859,8 @@ export default function ConnectPage() {
             <AnimatePresence mode="popLayout">
               {validationState === "validating" && (
                 <motion.div
+                  role="status"
+                  aria-live="polite"
                   initial={{ opacity: 0, y: -10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
@@ -827,6 +874,8 @@ export default function ConnectPage() {
               )}
               {validationState === "indexing" && (
                 <motion.div
+                  role="status"
+                  aria-live="polite"
                   initial={{ opacity: 0, y: -10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
@@ -857,6 +906,9 @@ export default function ConnectPage() {
                   initial={{ opacity: 0, y: -10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
+                  id="address-error"
+                  role="alert"
+                  aria-live="assertive"
                   className="mb-6 p-4 bg-red-500/10 border-2 border-red-500/50 rounded-xl text-red-400 text-sm text-center font-medium"
                 >
                   ⚠️ {localError}
@@ -884,8 +936,6 @@ export default function ConnectPage() {
                   <p className="font-bold mb-1">{t("networkMismatchTitle")}</p>
                   <p className="text-yellow-400/80 text-xs mb-3">
                     {t.rich("networkMismatchDescription", {
-                      actual: networkMismatch.actual,
-                      expected: networkMismatch.expected,
                       actual: (chunks) => (
                         <span className="font-bold text-yellow-300">{chunks}</span>
                       ),
@@ -962,7 +1012,9 @@ export default function ConnectPage() {
                     )}
                   </div>
                   <motion.button
+                    type="button"
                     onClick={handleContinue}
+                    disabled={Boolean(networkMismatch)}
                     className="w-full mt-4 px-6 py-3 rounded-xl font-bold text-black bg-theme-primary hover:bg-theme-primary/90 transition-colors flex items-center justify-center gap-2 focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                     whileHover={{ scale: 1.02 }}
                     whileTap={{ scale: 0.98 }}
@@ -975,6 +1027,7 @@ export default function ConnectPage() {
                 <motion.button
                   key="manual-connect"
                   ref={connectButtonRef}
+                  type="button"
                   onClick={handleConnect}
                   onKeyDown={handleConnectKeyDown}
                   disabled={
@@ -1007,6 +1060,7 @@ export default function ConnectPage() {
                   role="button"
                 >
                   <motion.div
+                    aria-hidden="true"
                     className="absolute -inset-1 rounded-xl blur-lg"
                     style={{
                       backgroundColor: "rgba(var(--color-theme-primary-rgb), 0.4)",
@@ -1055,10 +1109,11 @@ export default function ConnectPage() {
               </p>
               <motion.button
                 ref={freighterButtonRef}
+                type="button"
                 onClick={handleFreighterConnect}
                 onKeyDown={handleFreighterKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
@@ -1087,10 +1142,11 @@ export default function ConnectPage() {
               </motion.button>
 
               <motion.button
+                type="button"
                 onClick={handleAlbedoConnect}
                 onKeyDown={handleAlbedoKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
@@ -1119,10 +1175,11 @@ export default function ConnectPage() {
               </motion.button>
 
               <motion.button
+                type="button"
                 onClick={handleXBullConnect}
                 onKeyDown={handleXBullKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
@@ -1151,10 +1208,11 @@ export default function ConnectPage() {
               </motion.button>
 
               <motion.button
+                type="button"
                 onClick={handleWalletConnectConnect}
                 onKeyDown={handleWalletConnectKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
@@ -1190,7 +1248,7 @@ export default function ConnectPage() {
                   href="https://stellar.org/wallets"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="font-bold hover:text-white/80 transition-colors focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black focus:rounded"
+                  className="font-bold hover:opacity-80 transition-opacity focus:outline-none focus-visible:ring-2 focus-visible:ring-theme-primary focus-visible:ring-offset-2 focus-visible:ring-offset-black focus-visible:rounded"
                   style={{ color: "var(--color-theme-primary)" }}
                   tabIndex={0}
                   aria-label={t("getOneHereAria")}
@@ -1200,9 +1258,10 @@ export default function ConnectPage() {
               </p>
               <motion.button
                 ref={demoButtonRef}
+                type="button"
                 onClick={handleDemoMode}
                 onKeyDown={handleDemoKeyDown}
-                className="w-full text-xs sm:text-sm font-bold text-white/40 hover:text-white/60 transition-colors focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black focus:rounded"
+                className="w-full text-xs sm:text-sm font-bold text-white/60 hover:text-white/80 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-theme-primary focus-visible:ring-offset-2 focus-visible:ring-offset-black focus-visible:rounded"
                 whileHover={{ scale: 1.02 }}
                 whileTap={{ scale: 0.98 }}
                 tabIndex={0}

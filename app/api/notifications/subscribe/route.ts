@@ -1,20 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
+// KV_FAILURE: LOUD — a failed read or write means the subscription was not
+// persisted; the error propagates so the client can retry.
 import { kvGet, kvSet, kvSAdd, kvSRem, SUB_KEY, PERIOD_KEY } from "../_lib/kv";
 import { logger } from "@/app/utils/logger";
 import {
   getClientIp,
   checkRateLimit,
-  rateLimitResponse,
+  rateLimitDenialResponse,
   SUBSCRIBE_IP_LIMIT,
   SUBSCRIBE_IP_WINDOW,
+  SUBSCRIBE_WALLET_LIMIT,
+  SUBSCRIBE_WALLET_WINDOW,
 } from "../_lib/rateLimit";
 import type { SubscriptionRecord, PeriodPrefs } from "@/app/types/notifications";
+import { apiError, internalApiError } from "@/app/api/_lib/apiError";
+import { isValidWalletAddress as isValidWallet } from "@/src/utils/validateStellarAddress";
 
 const VALID_PERIODS = ["weekly", "monthly", "yearly"] as const;
-
-function isValidWallet(address: string): boolean {
-  return typeof address === "string" && address.startsWith("G") && address.length === 56;
-}
 
 async function syncPeriodIndex(
   walletAddress: string,
@@ -41,14 +43,16 @@ async function syncPeriodIndex(
 export async function POST(request: NextRequest) {
   try {
     const ip = getClientIp(request);
-    const ipLimitResult = await checkRateLimit(
-      `ratelimit:ip:subscribe:${ip}`,
-      SUBSCRIBE_IP_LIMIT,
-      SUBSCRIBE_IP_WINDOW
+    const ipDenial = rateLimitDenialResponse(
+      await checkRateLimit(
+        `ratelimit:ip:subscribe:${ip}`,
+        SUBSCRIBE_IP_LIMIT,
+        SUBSCRIBE_IP_WINDOW
+      ),
     );
 
-    if (!ipLimitResult.allowed) {
-      return rateLimitResponse(ipLimitResult.resetInSeconds);
+    if (ipDenial) {
+      return ipDenial;
     }
 
     const body = await request.json();
@@ -59,11 +63,25 @@ export async function POST(request: NextRequest) {
     };
 
     if (!isValidWallet(walletAddress)) {
-      return NextResponse.json({ error: "Invalid wallet address" }, { status: 400 });
+      return apiError("INVALID_WALLET", "Invalid wallet address", 400);
     }
 
     if (!subscription?.endpoint) {
-      return NextResponse.json({ error: "Invalid push subscription" }, { status: 400 });
+      return apiError("INVALID_PUSH_SUBSCRIPTION", "Invalid push subscription", 400);
+    }
+
+    // Keyed on the target wallet as well as the source IP: spreading a burst
+    // across many IPs must not let one wallet be subscribed arbitrarily often.
+    const walletDenial = rateLimitDenialResponse(
+      await checkRateLimit(
+        `ratelimit:wallet:subscribe:${walletAddress}`,
+        SUBSCRIBE_WALLET_LIMIT,
+        SUBSCRIBE_WALLET_WINDOW
+      )
+    );
+
+    if (walletDenial) {
+      return walletDenial;
     }
 
     const existing = (await kvGet<SubscriptionRecord>(SUB_KEY(walletAddress))) ?? {
@@ -95,7 +113,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ ok: true }, { status: 200 });
   } catch (err) {
-    logger.error("Internal error creating push subscription:", err);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return internalApiError(logger, err);
   }
 }
